@@ -22,6 +22,7 @@ from datetime import datetime
 import multiprocessing
 import queue
 import time
+import concurrent.futures
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -51,75 +52,84 @@ def gpu_worker(worker_id: int, target_gpu: int, input_queue: multiprocessing.Que
         
         print(f"✅ Worker {worker_id} Ready!")
 
-        while True:
-            task = input_queue.get() 
-            if task is None: # Sentinel to stop
-                break
-            
-            audio_path_str, relative_path = task
-            
-            try:
-                # 1. Load Audio
-                array, sampling_rate = sf.read(audio_path_str)
-                if sampling_rate != sr:
-                    array = librosa.resample(array, orig_sr=sampling_rate, target_sr=sr)
-                audio = array.astype(np.float32)
-
-                wav_tensor = torch.from_numpy(audio)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            while True:
+                task = input_queue.get() 
+                if task is None: # Sentinel to stop
+                    break
                 
-                # 2. VAD & Chunking
-                timestamps = get_speech_timestamps(wav_tensor, vad_model, return_seconds=True, sampling_rate=sr)
+                audio_path_str, relative_path = task
                 
-                chunks = []
-                for ts in timestamps:
-                    chunk_start = int(ts["start"] * sr)
-                    chunk_end = int(ts["end"] * sr)
-                    max_samples = max_chunk_s * sr
-                    while chunk_end - chunk_start > max_samples:
-                        chunks.append((chunk_start, chunk_start + max_samples))
-                        chunk_start += max_samples
-                    if chunk_end > chunk_start:
-                        chunks.append((chunk_start, chunk_end))
+                try:
+                    # 1. Load Audio
+                    array, sampling_rate = sf.read(audio_path_str, dtype='float32')
+                    if sampling_rate != sr:
+                        array = librosa.resample(array, orig_sr=sampling_rate, target_sr=sr)
+                    audio = array
 
-                if not chunks:
-                    merged = []
-                else:
-                    merged = []
-                    current_start, current_end = chunks[0]
-                    for chunk_start, chunk_end in chunks[1:]:
-                        if (chunk_end - current_start) <= max_chunk_s * sr:
-                            current_end = chunk_end
-                        else:
-                            merged.append((current_start, current_end))
-                            current_start, current_end = chunk_start, chunk_end
-                    merged.append((current_start, current_end))
+                    wav_tensor = torch.from_numpy(audio)
+                    
+                    # 2. VAD & Chunking
+                    timestamps = get_speech_timestamps(wav_tensor, vad_model, return_seconds=True, sampling_rate=sr)
+                    
+                    chunks = []
+                    for ts in timestamps:
+                        chunk_start = int(ts["start"] * sr)
+                        chunk_end = int(ts["end"] * sr)
+                        max_samples = max_chunk_s * sr
+                        while chunk_end - chunk_start > max_samples:
+                            chunks.append((chunk_start, chunk_start + max_samples))
+                            chunk_start += max_samples
+                        if chunk_end > chunk_start:
+                            chunks.append((chunk_start, chunk_end))
 
-                # 3. Transcribe
-                full_text = []
-                full_ipa = []
+                    if not chunks:
+                        merged = []
+                    else:
+                        merged = []
+                        current_start, current_end = chunks[0]
+                        for chunk_start, chunk_end in chunks[1:]:
+                            if (chunk_end - current_start) <= max_chunk_s * sr:
+                                current_end = chunk_end
+                            else:
+                                merged.append((current_start, current_end))
+                                current_start, current_end = chunk_start, chunk_end
+                        merged.append((current_start, current_end))
 
-                for chunk_start, chunk_end in merged:
-                    chunk = audio[chunk_start:chunk_end]
+                    # 3. Transcribe
+                    full_text = []
+                    full_ipa = []
 
-                    text_segs, _ = text_model.transcribe(chunk, beam_size=5, language=language, temperature=0, condition_on_previous_text=False)
-                    ipa_segs, _ = ipa_model.transcribe(chunk, beam_size=5, language=language, temperature=0, condition_on_previous_text=False, no_speech_threshold=0.1)
+                    for chunk_start, chunk_end in merged:
+                        chunk = audio[chunk_start:chunk_end]
 
-                    text_out = " ".join(s.text.strip() for s in text_segs).strip()
-                    ipa_out = " ".join(s.text.strip() for s in ipa_segs).strip()
+                        def get_text(c):
+                            segs, _ = text_model.transcribe(c, beam_size=5, language=language, temperature=0, condition_on_previous_text=False)
+                            return " ".join(s.text.strip() for s in segs).strip()
 
-                    if text_out: full_text.append(text_out)
-                    if ipa_out: full_ipa.append(ipa_out)
+                        def get_ipa(c):
+                            segs, _ = ipa_model.transcribe(c, beam_size=5, language=language, temperature=0, condition_on_previous_text=False, no_speech_threshold=0.1)
+                            return " ".join(s.text.strip() for s in segs).strip()
 
-                # 4. Send Result
-                result_queue.put({
-                    'filename': relative_path,
-                    'text': " ".join(full_text),
-                    'phonemes': " ".join(full_ipa),
-                    'processed_at': datetime.now().isoformat()
-                })
-            except Exception as e:
-                logger.error(f"Error processing {relative_path}: {e}")
-                result_queue.put({'error': str(e), 'filename': relative_path})
+                        f_text = executor.submit(get_text, chunk)
+                        f_ipa = executor.submit(get_ipa, chunk)
+
+                        text_out = f_text.result()
+                        ipa_out = f_ipa.result()
+
+                        if text_out: full_text.append(text_out)
+                        if ipa_out: full_ipa.append(ipa_out)
+
+                    # 4. Send Result
+                    result_queue.put({
+                        'filename': relative_path,
+                        'text': " ".join(full_text),
+                        'phonemes': " ".join(full_ipa),
+                        'processed_at': datetime.now().isoformat()
+                    })
+                except Exception as e:
+                    logger.error(f"Error processing {relative_path}: {e}")
+                    result_queue.put({'error': str(e), 'filename': relative_path})
 
     except Exception as e:
         logger.critical(f"Worker {worker_id} crashed: {e}")
