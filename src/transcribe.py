@@ -28,7 +28,7 @@ MODEL_ID = "malper/abjadsr-he-finetune"
 # Processor not uploaded to fine-tune repo — confirmed same arch as openai/whisper-large-v3-turbo
 PROCESSOR_ID = "openai/whisper-large-v3-turbo"
 SR = 16000
-MAX_CHUNK_S = 25
+MAX_CHUNK_S = 15
 BATCH_SIZE = 8  # chunks per model.generate() call
 
 
@@ -123,10 +123,12 @@ def gpu_worker(worker_id: int, target_gpu: int, input_queue: multiprocessing.Que
                         padding=True,
                     )
                     input_features = inputs.input_features.to(device, dtype=dtype)
+                    attention_mask = inputs.attention_mask.to(device) if "attention_mask" in inputs else None
 
                     with torch.no_grad():
                         generated = model.generate(
                             input_features,
+                            attention_mask=attention_mask,
                             forced_decoder_ids=forced_ids,
                             max_new_tokens=444,
                         )
