@@ -28,7 +28,7 @@ MODEL_ID = "malper/abjadsr-he-finetune"
 # Processor not uploaded to fine-tune repo — confirmed same arch as openai/whisper-large-v3-turbo
 PROCESSOR_ID = "openai/whisper-large-v3-turbo"
 SR = 16000
-MAX_CHUNK_S = 15
+MAX_CHUNK_S = 25
 BATCH_SIZE = 8  # chunks per model.generate() call
 
 
