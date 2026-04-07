@@ -9,7 +9,7 @@ import pandas as pd
 from datasets import load_dataset, Audio
 from tqdm import tqdm
 
-TARGET_DIR = "./dataset_output"
+TARGET_DIR = "./dataset_output/audio"
 os.makedirs(TARGET_DIR, exist_ok=True)
 
 ds = load_dataset("yanirmr/VoxKnesset", split="train", streaming=True)
