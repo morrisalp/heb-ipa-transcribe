@@ -55,9 +55,52 @@ def gpu_worker(worker_id: int, target_gpu: int, input_queue: multiprocessing.Que
 
         print(f"Worker {worker_id} Ready!")
 
+        # Cross-file chunk buffer: (file_id, chunk_idx, audio_array)
+        chunk_buffer: List[Tuple[str, int, any]] = []
+        file_n_chunks: Dict[str, int] = {}       # file_id -> total chunk count
+        chunk_results: Dict[str, Dict[int, str]] = {}  # file_id -> {chunk_idx: transcript}
+
+        def run_generate(items):
+            arrays = [item[2] for item in items]
+            inputs = processor(arrays, sampling_rate=SR, return_tensors="pt", padding=True)
+            input_features = inputs.input_features.to(device, dtype=dtype)
+            attention_mask = inputs.attention_mask.to(device) if "attention_mask" in inputs else None
+            with torch.no_grad():
+                generated = model.generate(
+                    input_features,
+                    attention_mask=attention_mask,
+                    forced_decoder_ids=forced_ids,
+                    max_new_tokens=444,
+                )
+            decoded = processor.batch_decode(generated, skip_special_tokens=True)
+            for (file_id, chunk_idx, _), raw in zip(items, decoded):
+                chunk_results.setdefault(file_id, {})[chunk_idx] = raw.strip()
+
+        def flush(force=False):
+            while len(chunk_buffer) >= batch_size or (force and chunk_buffer):
+                n = min(batch_size, len(chunk_buffer))
+                run_generate(chunk_buffer[:n])
+                del chunk_buffer[:n]
+
+        def emit_ready():
+            for file_id in list(file_n_chunks.keys()):
+                if len(chunk_results.get(file_id, {})) >= file_n_chunks[file_id]:
+                    n = file_n_chunks.pop(file_id)
+                    results = chunk_results.pop(file_id)
+                    transcripts = [results[i] for i in range(n)]
+                    result_queue.put({
+                        'file_id': file_id,
+                        'transcript': " ".join(transcripts),
+                        'chunks': [{"file_id": file_id, "chunk_idx": i, "transcript": t}
+                                   for i, t in enumerate(transcripts)],
+                        'processed_at': datetime.now().isoformat(),
+                    })
+
         while True:
             task = input_queue.get()
             if task is None:
+                flush(force=True)
+                emit_ready()
                 break
 
             audio_path_str, file_id = task
@@ -99,52 +142,16 @@ def gpu_worker(worker_id: int, target_gpu: int, input_queue: multiprocessing.Que
                 # 3. Save chunk wavs
                 target_dir = os.path.join(chunks_dir, file_id)
                 os.makedirs(target_dir, exist_ok=True)
-
                 for i, chunk in enumerate(merged_chunks):
                     sf.write(os.path.join(target_dir, f"{i:03d}.wav"), chunk, SR)
 
-                # 4. Batched transcription
-                chunk_transcripts: List[str] = []
-                chunk_metadata: List[Dict] = []
+                # 4. Queue chunks for cross-file batched inference
+                file_n_chunks[file_id] = len(merged_chunks)
+                for i, chunk in enumerate(merged_chunks):
+                    chunk_buffer.append((file_id, i, chunk))
 
-                for batch_start in range(0, len(merged_chunks), batch_size):
-                    batch = merged_chunks[batch_start:batch_start + batch_size]
-
-                    inputs = processor(
-                        batch,
-                        sampling_rate=SR,
-                        return_tensors="pt",
-                        padding=True,
-                    )
-                    input_features = inputs.input_features.to(device, dtype=dtype)
-                    attention_mask = inputs.attention_mask.to(device) if "attention_mask" in inputs else None
-
-                    with torch.no_grad():
-                        generated = model.generate(
-                            input_features,
-                            attention_mask=attention_mask,
-                            forced_decoder_ids=forced_ids,
-                            max_new_tokens=444,
-                        )
-
-                    decoded = processor.batch_decode(generated, skip_special_tokens=True)
-
-                    for i, raw in enumerate(decoded):
-                        chunk_idx = batch_start + i
-                        raw = raw.strip()
-                        chunk_transcripts.append(raw)
-                        chunk_metadata.append({
-                            "file_id": file_id,
-                            "chunk_idx": chunk_idx,
-                            "transcript": raw,
-                        })
-
-                result_queue.put({
-                    'file_id': file_id,
-                    'transcript': " ".join(chunk_transcripts),
-                    'chunks': chunk_metadata,
-                    'processed_at': datetime.now().isoformat()
-                })
+                flush()
+                emit_ready()
 
             except Exception as e:
                 logger.error(f"Error processing {file_id}: {e}")
