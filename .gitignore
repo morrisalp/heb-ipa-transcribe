@@ -5,3 +5,6 @@ __pycache__/
 ipa_voxknesset
 ipa_voxknesset_1
 dataset_output
+metadata_ipa.csv
+metadata_chunks.csv
+checkpoint_ipa.json

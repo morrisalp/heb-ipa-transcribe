@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
 Audio IPA Transcriber - MULTI GPU / MULTI WORKER
-Uses malper/abjadsr-he-finetune: outputs word-aligned hebrew=ascii_ipa pairs.
-uv run src/transcribe.py
+Uses malper/abjadsr-he: outputs Hebrew IPA transcription.
+uv run src/transcribe.py [--input-dir DIR] [--chunks-dir DIR] [--batch-size N] [--workers-per-gpu N]
 """
 
 import os
 import json
+import argparse
 import pandas as pd
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -24,21 +25,15 @@ from transformers import WhisperForConditionalGeneration, WhisperProcessor
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-MODEL_ID = "malper/abjadsr-he-finetune"
-# Processor not uploaded to fine-tune repo — confirmed same arch as openai/whisper-large-v3-turbo
+MODEL_ID = "malper/abjadsr-he"
+# Processor not uploaded to model repo — confirmed same arch as openai/whisper-large-v3-turbo
 PROCESSOR_ID = "openai/whisper-large-v3-turbo"
 SR = 16000
 MAX_CHUNK_S = 25
-BATCH_SIZE = 8  # chunks per model.generate() call
+DEFAULT_BATCH_SIZE = 8  # chunks per model.generate() call
 
 
-def parse_output(output: str) -> Tuple[str, str]:
-    """Split 'word=ipa ...' into (hebrew_text, ascii_ipa)."""
-    pairs = [token.split("=", 1) for token in output.split() if "=" in token]
-    return " ".join(p[0] for p in pairs), " ".join(p[1] for p in pairs)
-
-
-def gpu_worker(worker_id: int, target_gpu: int, input_queue: multiprocessing.Queue, result_queue: multiprocessing.Queue, chunks_dir: str):
+def gpu_worker(worker_id: int, target_gpu: int, input_queue: multiprocessing.Queue, result_queue: multiprocessing.Queue, chunks_dir: str, batch_size: int):
     try:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(target_gpu)
 
@@ -78,8 +73,7 @@ def gpu_worker(worker_id: int, target_gpu: int, input_queue: multiprocessing.Que
                 if not timestamps:
                     result_queue.put({
                         'filename': relative_path,
-                        'text': "",
-                        'phonemes': "",
+                        'transcript': "",
                         'processed_at': datetime.now().isoformat()
                     })
                     continue
@@ -109,12 +103,11 @@ def gpu_worker(worker_id: int, target_gpu: int, input_queue: multiprocessing.Que
                     sf.write(os.path.join(target_dir, f"{base_name}_{i:03d}.wav"), chunk, SR)
 
                 # 4. Batched transcription
-                full_text: List[str] = []
-                full_ipa: List[str] = []
+                chunk_transcripts: List[str] = []
                 chunk_metadata: List[Dict] = []
 
-                for batch_start in range(0, len(merged_chunks), BATCH_SIZE):
-                    batch = merged_chunks[batch_start:batch_start + BATCH_SIZE]
+                for batch_start in range(0, len(merged_chunks), batch_size):
+                    batch = merged_chunks[batch_start:batch_start + batch_size]
 
                     inputs = processor(
                         batch,
@@ -137,21 +130,16 @@ def gpu_worker(worker_id: int, target_gpu: int, input_queue: multiprocessing.Que
 
                     for i, raw in enumerate(decoded):
                         chunk_idx = batch_start + i
-                        t_out, i_out = parse_output(raw.strip())
-                        if t_out:
-                            full_text.append(t_out)
-                        if i_out:
-                            full_ipa.append(i_out)
+                        raw = raw.strip()
+                        chunk_transcripts.append(raw)
                         chunk_metadata.append({
                             "filename": os.path.join(relative_dir, f"{base_name}_{chunk_idx:03d}.wav"),
-                            "text": t_out,
-                            "phonemes": i_out,
+                            "transcript": raw,
                         })
 
                 result_queue.put({
                     'filename': relative_path,
-                    'text': " ".join(full_text),
-                    'phonemes': " ".join(full_ipa),
+                    'transcript': " ".join(chunk_transcripts),
                     'chunks': chunk_metadata,
                     'processed_at': datetime.now().isoformat()
                 })
@@ -167,12 +155,13 @@ def gpu_worker(worker_id: int, target_gpu: int, input_queue: multiprocessing.Que
 
 
 class Transcriber:
-    def __init__(self, input_dir: str, chunks_dir: str, workers_per_gpu: int = 1):
+    def __init__(self, input_dir: str, chunks_dir: str, workers_per_gpu: int = 1, batch_size: int = DEFAULT_BATCH_SIZE):
         self.input_dir = Path(input_dir)
         self.chunks_dir = Path(chunks_dir)
         self.output_csv = self.input_dir / "metadata_ipa.csv"
         self.chunks_csv = self.input_dir / "metadata_chunks.csv"
         self.checkpoint_file = self.input_dir / "checkpoint_ipa.json"
+        self.batch_size = batch_size
 
         try:
             self.num_gpus = torch.cuda.device_count()
@@ -219,10 +208,7 @@ class Transcriber:
     def export_csv(self, checkpoint: Dict):
         results = list(checkpoint["processed"].values())
         if results:
-            for r in results:
-                if 'text' not in r:
-                    r['text'] = ''
-            df = pd.DataFrame(results)[['filename', 'text', 'phonemes']]
+            df = pd.DataFrame(results)[['filename', 'transcript']]
             df.to_csv(self.output_csv, index=False)
 
     def process_batch(self, tasks: List[Tuple[str, str]], checkpoint: Dict):
@@ -241,7 +227,7 @@ class Transcriber:
             for _ in range(self.workers_per_gpu):
                 p = multiprocessing.Process(
                     target=gpu_worker,
-                    args=(worker_id, gpu_id, input_queue, result_queue, str(self.chunks_dir))
+                    args=(worker_id, gpu_id, input_queue, result_queue, str(self.chunks_dir), self.batch_size)
                 )
                 p.start()
                 workers.append(p)
@@ -256,8 +242,7 @@ class Transcriber:
                 if 'error' not in res:
                     checkpoint["processed"][res['filename']] = {
                         "filename": res['filename'],
-                        "text": res.get('text', ''),
-                        "phonemes": res.get('phonemes', '')
+                        "transcript": res.get('transcript', ''),
                     }
                     if 'chunks' in res:
                         self.append_chunks_csv(res['chunks'])
@@ -280,7 +265,7 @@ class Transcriber:
 
     def run(self):
         print(f"Scanning {self.input_dir} for .wav files...")
-        print(f"Config: {self.num_gpus} GPU(s), {self.workers_per_gpu} worker(s) per GPU ({self.total_workers} total).")
+        print(f"Config: {self.num_gpus} GPU(s), {self.workers_per_gpu} worker(s) per GPU ({self.total_workers} total), batch_size={self.batch_size}.")
 
         checkpoint = self.load_checkpoint()
         tasks = self.get_pending_tasks(set(checkpoint["processed"].keys()))
@@ -297,13 +282,22 @@ class Transcriber:
 if __name__ == "__main__":
     multiprocessing.set_start_method('spawn', force=True)
 
-    TARGET_DIR = "./dataset_output"
-    CHUNKS_DIR = "./ipa_voxknesset"
-    os.makedirs(TARGET_DIR, exist_ok=True)
-    os.makedirs(CHUNKS_DIR, exist_ok=True)
+    parser = argparse.ArgumentParser(description="Transcribe Hebrew audio to IPA using malper/abjadsr-he.")
+    parser.add_argument("--input-dir", default="./dataset_output", help="Directory containing .wav files to transcribe (default: ./dataset_output)")
+    parser.add_argument("--chunks-dir", default="./ipa_voxknesset", help="Directory to write VAD-split audio chunks (default: ./ipa_voxknesset)")
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE, help=f"Chunks per model.generate() call (default: {DEFAULT_BATCH_SIZE})")
+    parser.add_argument("--workers-per-gpu", type=int, default=1, help="Worker processes per GPU (default: 1)")
+    args = parser.parse_args()
 
-    # 1 worker per GPU — HF model is larger than CTranslate2; increase if VRAM allows
-    generator = Transcriber(input_dir=TARGET_DIR, chunks_dir=CHUNKS_DIR, workers_per_gpu=1)
+    os.makedirs(args.input_dir, exist_ok=True)
+    os.makedirs(args.chunks_dir, exist_ok=True)
+
+    generator = Transcriber(
+        input_dir=args.input_dir,
+        chunks_dir=args.chunks_dir,
+        workers_per_gpu=args.workers_per_gpu,
+        batch_size=args.batch_size,
+    )
 
     try:
         generator.run()
