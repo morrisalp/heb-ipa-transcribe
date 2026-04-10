@@ -26,7 +26,7 @@ from datasets import Dataset
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-MODEL_ID = "malper/abjadsr-he"
+MODEL_ID = "malper/abjadsr-he-ipa"
 # Processor not uploaded to model repo — confirmed same arch as openai/whisper-large-v3-turbo
 PROCESSOR_ID = "openai/whisper-large-v3-turbo"
 HF_DATASET_ID = "malper/knesset-vox-ipa"
